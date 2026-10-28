@@ -17,11 +17,10 @@ import pyproj
 import rasterio
 import rioxarray
 import xarray as xr
-from opera_utils.disp._remote import open_file
 from rasterio.transform import Affine
 from rioxarray.merge import merge_arrays
 
-from .auth import authenticate
+from .auth import authenticate, open_granule
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +226,7 @@ def warp_dataarray_to_grid(
             source_path = source_candidate
         elif source_str.startswith(("http://", "https://")):
             with (
-                open_file(
+                open_granule(
                     source_str,
                     earthdata_username=username,
                     earthdata_password=password,
@@ -506,7 +505,7 @@ def compile_and_load_data(
                 suffix = source_candidate.suffix or ".tif"
                 source_path = cache_dir / f"{uuid.uuid4().hex}{suffix}"
                 with (
-                    open_file(
+                    open_granule(
                         link,
                         earthdata_username=username,
                         earthdata_password=password,

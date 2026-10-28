@@ -87,6 +87,8 @@ def fetch_missing_dems(bbox: list, local_dir: Path) -> None:
 
     import earthaccess
 
+    from .auth import open_granule, podaac_s3_enabled
+
     logger = logging.getLogger(__name__)
 
     # Look back 90 days to ensure we find a valid DEM
@@ -147,7 +149,19 @@ def fetch_missing_dems(bbox: list, local_dir: Path) -> None:
         logger.info(
             f"[DEM Fetcher] Downloading {len(dem_urls)} unique DEM layers to {local_dir}..."
         )
-        earthaccess.download(dem_urls, local_path=str(local_dir))
+        if podaac_s3_enabled():
+            # Inside AWS us-west-2 the PO.DAAC HTTPS links refuse downloads; read from S3.
+            import shutil
+
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            for url in dem_urls:
+                with (
+                    open_granule(url) as remote_file,
+                    open(Path(local_dir) / url.rsplit("/", 1)[-1], "wb") as local_file,
+                ):
+                    shutil.copyfileobj(remote_file, local_file)
+        else:
+            earthaccess.download(dem_urls, local_path=str(local_dir))
         logger.info("[DEM Fetcher] Topography download complete.")
 
     except Exception as e:
@@ -208,12 +222,15 @@ def get_S1_orbit_direction(
         return ""
 
     import rasterio
-    from opera_utils.disp._remote import open_file
+
+    from .auth import open_granule
 
     url = urls[0]
     try:
         if url.startswith("http") and not url.startswith("/vsi"):
-            f = open_file(url, earthdata_username=username, earthdata_password=password)
+            f = open_granule(
+                url, earthdata_username=username, earthdata_password=password
+            )
             with rasterio.open(f) as ds:
                 tags = ds.tags()
         else:

@@ -625,7 +625,7 @@ def run_download_only(
     import concurrent.futures
     import shutil
 
-    from opera_utils.disp._remote import open_file
+    from .auth import open_granule
 
     # Pre-check for unsupported products before authenticating or downloading
     if product:
@@ -836,7 +836,7 @@ def run_download_only(
         for attempt in range(max_retries):
             try:
                 # Use Earthdata authenticated file opener and stream to disk
-                with open_file(
+                with open_granule(
                     url, earthdata_username=username, earthdata_password=password
                 ) as f_in:
                     with open(local_path, "wb") as f_out:
