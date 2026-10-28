@@ -6,6 +6,7 @@ from typing import Optional
 
 import click
 
+from .auth import PODAAC_S3_ENV, set_podaac_s3
 from .io import parse_bbox_input
 from .pipeline import PipelineConfig, run_pipeline
 
@@ -33,6 +34,22 @@ VALID_FUNCTIONS = ["opera_search", "both"]
 def cli() -> None:
     """Disaster products pipeline CLI."""
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+def podaac_s3_option(command):
+    """--podaac-s3 for the commands that read granules from PO.DAAC."""
+    return click.option(
+        "--podaac-s3",
+        is_flag=True,
+        default=False,
+        help=(
+            "Read PO.DAAC granules (DSWx-HLS, DSWx-S1) directly from S3 instead of over HTTPS. "
+            "Use this inside AWS us-west-2 (for example on NASA MAAP), where PO.DAAC refuses "
+            "HTTPS downloads. PO.DAAC S3 credentials come from AWS_ACCESS_KEY_ID, "
+            "AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN if set, otherwise from the Earthdata "
+            f"login. Same as setting {PODAAC_S3_ENV}=1."
+        ),
+    )(command)
 
 
 def _parse_zoom_bbox(zoom_bbox: str) -> list[float]:
@@ -222,6 +239,7 @@ def _parse_zoom_bbox(zoom_bbox: str) -> list[float]:
     default=False,
     help="Disable searching and downloading of HLS source scenes (Red, Green, Blue, NIR, Fmask).",
 )
+@podaac_s3_option
 def run(
     bbox: str,
     zoom_bbox: Optional[str],
@@ -244,8 +262,11 @@ def run(
     compute_cloudiness: bool,
     skip_existing: bool,
     no_hls: bool,
+    podaac_s3: bool,
 ) -> None:
     """Run the disaster pipeline (end-to-end)."""
+    if podaac_s3:
+        set_podaac_s3(True)
     if mode and product:
         raise click.UsageError(
             "You cannot use both --mode and --product at the same time."
@@ -489,6 +510,7 @@ def search(
     default=False,
     help="Disable downloading of HLS source scenes to save bandwidth and disk space.",
 )
+@podaac_s3_option
 def download(
     bbox: str,
     output_dir: Path,
@@ -498,8 +520,11 @@ def download(
     product: tuple[str, ...],
     compute_cloudiness: bool,
     no_hls: bool,
+    podaac_s3: bool,
 ) -> None:
     """Download OPERA granules over an AOI/time window for local use."""
+    if podaac_s3:
+        set_podaac_s3(True)
     if mode and product:
         raise click.UsageError(
             "You cannot use both --mode and --product at the same time."
@@ -642,10 +667,16 @@ def mosaic(
     required=True,
     help="Directory where the generated dem.tif and slope.tif will be saved.",
 )
+@podaac_s3_option
 def slope_filter(
-    local_dir: Optional[Path], slope_threshold: float, output_dir: Path
+    local_dir: Optional[Path],
+    slope_threshold: float,
+    output_dir: Path,
+    podaac_s3: bool,
 ) -> None:
     """Generate a standalone DEM and slope mask from local OPERA products."""
+    if podaac_s3:
+        set_podaac_s3(True)
 
     if not local_dir:
         raise click.UsageError(
