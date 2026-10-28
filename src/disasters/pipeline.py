@@ -22,7 +22,7 @@ from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
 
 # Local/Relative Imports
-from .auth import authenticate
+from .auth import authenticate, podaac_gdal_path
 from .catalog import cluster_by_time, get_S1_orbit_direction, read_opera_metadata
 from .diff import (
     compute_and_write_difference,
@@ -178,7 +178,7 @@ def get_local_spatial_properties(df_opera: pd.DataFrame) -> tuple[list[float], s
     def read_file_properties(f):
         """Read bounds and CRS from a single file."""
         try:
-            with rasterio.open(f) as src:
+            with rasterio.open(podaac_gdal_path(f) or f) as src:
                 bounds = src.bounds
                 crs = src.crs
 
@@ -1956,7 +1956,7 @@ def generate_products(
                             opened_datasets = []
                             for u in urls:
                                 # Stream remote HTTP links through GDAL's virtual file system
-                                gdal_url = (
+                                gdal_url = podaac_gdal_path(u) or (
                                     f"/vsicurl/{u}"
                                     if u.startswith("http")
                                     and not u.startswith("/vsicurl/")

@@ -13,6 +13,7 @@ import rasterio
 import xarray as xr
 from osgeo import gdal
 
+from .auth import podaac_gdal_path
 from .mosaic import get_image_colormap
 
 logger = logging.getLogger(__name__)
@@ -485,7 +486,9 @@ def process_dem_and_slope(
                 if "_B01_WTR" in url:
                     if url.startswith("http") and not url.startswith("/vsi"):
                         dem_url = url.replace("_B01_WTR", "_B10_DEM")
-                        dem_urls.append(f"/vsicurl/{dem_url}")
+                        dem_urls.append(
+                            podaac_gdal_path(dem_url) or f"/vsicurl/{dem_url}"
+                        )
                     else:
                         local_dem_path = url.replace("_B01_WTR", "_B10_DEM")
                         dem_urls.append(local_dem_path)
@@ -556,7 +559,7 @@ def process_dem_and_slope(
             "[Filters] Cleaning up individual DEM granules to save disk space..."
         )
         for url in dem_urls:
-            if not url.startswith("/vsicurl/"):
+            if not url.startswith(("/vsicurl/", "/vsis3/")):
                 try:
                     Path(url).unlink(missing_ok=True)
                 except Exception as e:
