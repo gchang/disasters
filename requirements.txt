@@ -13,4 +13,5 @@ pygmt
 pyproj
 rasterio
 rioxarray<0.20.0
+s3fs
 xarray

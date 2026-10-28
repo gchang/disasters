@@ -28,6 +28,7 @@ dependencies:
   - gmt=6.6.0=*_7
   - rasterio
   - rioxarray<0.20.0
+  - s3fs
   - tabulate
   - xarray
   - zarr
