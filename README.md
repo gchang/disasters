@@ -213,6 +213,20 @@ opera-disaster mosaic -i /path/to/local/data -o mosaics_out -b "35 37 -115 -113"
 
 If `-b` is omitted, the command computes the geographic union of the local inputs automatically.
 
+### Running inside AWS us-west-2 (for example NASA MAAP)
+
+The OPERA DSWx-HLS and DSWx-S1 tiles are archived at PO.DAAC. From inside AWS us-west-2, PO.DAAC answers HTTPS downloads of these tiles with a redirect to an in-region S3 address that refuses the read (HTTP 403), so `run` cannot fetch them over HTTPS there. In that region the same files can be read directly from PO.DAAC's S3 bucket: a link `https://archive.podaac.earthdata.nasa.gov/<bucket>/<key>` is `s3://<bucket>/<key>`. Turn this on with `--podaac-s3` or by setting `DISASTERS_PODAAC_S3=1`:
+
+```bash
+opera-disaster run -b "36 36.5 -114.5 -114" -m flood -d 2026-10-21 -n 2 -o LakeMead -lt "Lake Mead Floods" --podaac-s3
+# or
+DISASTERS_PODAAC_S3=1 opera-disaster run -b "36 36.5 -114.5 -114" -m flood -d 2026-10-21 -n 2 -o LakeMead -lt "Lake Mead Floods"
+```
+
+- PO.DAAC S3 credentials: if `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` are set, they are used as they are (a platform can supply PO.DAAC credentials this way). Otherwise the code gets temporary credentials from PO.DAAC with your Earthdata login (`~/.netrc`, through `earthaccess`) and gets new ones every 45 minutes, before the one-hour credentials expire.
+- Only PO.DAAC links change. ASF and LP DAAC data are read as before, and the ASF S3 credentials used for those reads are kept separate from the PO.DAAC ones.
+- Direct S3 reads only work from AWS us-west-2. Outside AWS, leave the option off (the default); the HTTPS route works there unchanged. When `AWS_REGION` or `AWS_DEFAULT_REGION` is `us-west-2` and the option is off, the log says so as a hint.
+
 ### Command-line Arguments
 
 | Argument             | Required | Description                                                                                   |
@@ -235,6 +249,7 @@ If `-b` is omitted, the command computes the geographic union of the local input
 | `-c`, `--compute_cloudiness` | No | Flag to enable HLS cloud cover calculation during the search step. |
 | `-zb`, `--zoom_bbox`  | No       | Optional inset extent for `run`, as `South North West East`. Must be enclosed in quotes.|
 | `--skip-existing`  | No      | Optional feature to skip the generation of geotiffs, difference maps, or layouts that already exist in the output directory. Default is `False`. |
+| `--podaac-s3`  | No      | Read PO.DAAC granules (DSWx-HLS, DSWx-S1) directly from S3 instead of over HTTPS. Needed inside AWS us-west-2, for example on NASA MAAP; see [Running inside AWS us-west-2](#running-inside-aws-us-west-2-for-example-nasa-maap). Also on `download` and `slope-filter`. Default is `False`. |
 
 ### Disaster Modes
 
