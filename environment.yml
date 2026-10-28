@@ -1,0 +1,34 @@
+name: disasters
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - gdal=3.12
+  - libgdal=3.12
+  - numpy
+  - asf_search
+  - beautifulsoup4
+  - boto3
+  - click
+  - earthaccess
+  - fiona
+  - geopandas
+  - jupyterlab
+  - leafmap
+  - lxml
+  - matplotlib
+  - opera-utils=0.25.3
+  - osmnx
+  - pandas
+  - pip
+  - pygmt
+  - rasterio
+  - rioxarray<0.20.0
+  - tabulate
+  - xarray
+  - zarr
+  - openpyxl
+  - pre-commit
+
+  - pip:
+      - git+https://github.com/OPERA-Cal-Val/next_pass.git@main

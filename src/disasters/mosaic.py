@@ -1,0 +1,1324 @@
+import concurrent.futures
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from collections import Counter
+from pathlib import Path
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import pyproj
+import rasterio
+import rioxarray
+import xarray as xr
+from opera_utils.disp._remote import open_file
+from rasterio.transform import Affine
+from rioxarray.merge import merge_arrays
+
+from .auth import authenticate
+
+logger = logging.getLogger(__name__)
+
+
+def get_master_crs(df_opera: pd.DataFrame, mode: str) -> Optional[str]:
+    """
+    Calculates the most common UTM CRS from the metadata WKT geometries.
+    """
+    logger.info("Determining Global Master CRS from geometric metadata...")
+    from shapely import wkt
+
+    valid_geoms = pd.Series(dtype=object)
+    if "Geometry (WKT)" in df_opera.columns:
+        # Grab all valid WKT geometries from the pre-filtered dataframe
+        valid_geoms = df_opera["Geometry (WKT)"].dropna()
+        valid_geoms = valid_geoms[valid_geoms != "N/A"]
+
+    epsg_counter = Counter()
+
+    for geom_str in valid_geoms:
+        try:
+            geom = wkt.loads(geom_str)
+            center_lon = geom.centroid.x
+            center_lat = geom.centroid.y
+
+            # Geometrically calculate the UTM zone number
+            zone_number = int((center_lon + 180) / 6) + 1
+            is_northern = center_lat >= 0
+
+            # Map to standard EPSG codes for UTM
+            epsg = 32600 + zone_number if is_northern else 32700 + zone_number
+            epsg_counter[epsg] += 1
+        except Exception:
+            continue
+
+    if not epsg_counter:
+        logger.info("Falling back to raster header CRS detection.")
+        url_cols = [c for c in df_opera.columns if c.startswith("Download URL")]
+        all_files = []
+        for col in url_cols:
+            all_files.extend(df_opera[col].dropna().tolist())
+
+        crs_counter = Counter()
+        for filepath in set(all_files):
+            try:
+                with rasterio.open(filepath) as src:
+                    if src.crs is not None:
+                        crs_counter[src.crs.to_epsg() or src.crs.to_string()] += 1
+            except Exception:
+                continue
+
+        if not crs_counter:
+            raise RuntimeError(
+                "Could not determine CRS: no valid geometries or readable raster CRS metadata found."
+            )
+
+        most_common_crs, count = crs_counter.most_common(1)[0]
+        crs_obj = pyproj.CRS.from_user_input(most_common_crs)
+        logger.info(
+            f"Global Master CRS determined from raster headers: {crs_obj.name} ({crs_obj.to_string()})"
+        )
+        logger.info(f"Found in {count}/{len(set(all_files))} granules.")
+        return crs_obj.to_string()
+
+    most_common_epsg, count = epsg_counter.most_common(1)[0]
+
+    crs_obj = pyproj.CRS.from_epsg(most_common_epsg)
+    utm_name = crs_obj.name
+
+    logger.info(f"Global Master CRS determined: {utm_name} (EPSG:{most_common_epsg})")
+    logger.info(f"Found in {count}/{len(valid_geoms)} granules.")
+
+    return f"EPSG:{most_common_epsg}"
+
+
+def get_master_grid_props(
+    bbox_latlon: list, target_crs_proj4: str, target_res: int = 30
+) -> dict:
+    """
+    Defines a master pixel-aligned grid based on a lat/lon BBOX and target CRS.
+
+    Args:
+        bbox_latlon (list): Bounding box [S, N, W, E] in EPSG:4326.
+        target_crs_proj4 (str): The PROJ4 string for the target master CRS.
+        target_res (int): The target resolution in meters.
+
+    Returns:
+        dict: A dictionary with 'dst_crs', 'shape', 'transform' for rioxarray.reproject.
+    """
+    # Define transformers
+    transformer = pyproj.Transformer.from_crs(
+        "EPSG:4326", target_crs_proj4, always_xy=True
+    )
+
+    # Get corners in target CRS
+    corners_lon = [bbox_latlon[2], bbox_latlon[3], bbox_latlon[3], bbox_latlon[2]]
+    corners_lat = [bbox_latlon[0], bbox_latlon[0], bbox_latlon[1], bbox_latlon[1]]
+
+    xs, ys = transformer.transform(corners_lon, corners_lat)
+
+    # Find min/max of transformed coordinates
+    xmin = min(xs)
+    ymin = min(ys)
+    xmax = max(xs)
+    ymax = max(ys)
+
+    # Snap extent to be pixel-aligned to the resolution, ensuring any grid defined this way will be aligned.
+    xmin = np.floor(xmin / target_res) * target_res
+    ymin = np.floor(ymin / target_res) * target_res
+    xmax = np.ceil(xmax / target_res) * target_res
+    ymax = np.ceil(ymax / target_res) * target_res
+
+    # Calculate final width and height in pixels
+    width = int((xmax - xmin) / target_res)
+    height = int((ymax - ymin) / target_res)
+
+    # Create the GDAL/Rasterio Affine transform
+    transform = Affine.translation(xmin, ymax) * Affine.scale(target_res, -target_res)
+
+    return {
+        "dst_crs": target_crs_proj4,
+        "shape": (height, width),
+        "transform": transform,
+    }
+
+
+def _grid_bounds_from_master_grid(
+    master_grid: dict,
+) -> tuple[float, float, float, float]:
+    """Return (xmin, ymin, xmax, ymax) bounds for a pixel-aligned master grid."""
+    transform = master_grid["transform"]
+    height, width = master_grid["shape"]
+    xres = transform.a
+    yres = abs(transform.e)
+    xmin = transform.c
+    ymax = transform.f
+    xmax = xmin + (width * xres)
+    ymin = ymax - (height * yres)
+    return xmin, ymin, xmax, ymax
+
+
+def _resolve_gdalwarp_binary() -> str:
+    """Locate the gdalwarp executable in the active environment."""
+    candidate = Path(sys.executable).resolve().parent / "gdalwarp"
+    if candidate.exists():
+        return str(candidate)
+
+    binary = shutil.which("gdalwarp")
+    if binary:
+        return binary
+
+    raise FileNotFoundError("Could not locate gdalwarp in the active environment.")
+
+
+def _build_gdalwarp_env() -> dict:
+    """Ensure external GDAL subprocesses can find PROJ data."""
+    env = os.environ.copy()
+    if env.get("PROJ_LIB"):
+        return env
+
+    proj_candidate = Path(sys.executable).resolve().parent.parent / "share" / "proj"
+    if proj_candidate.exists():
+        env["PROJ_LIB"] = str(proj_candidate)
+    return env
+
+
+def _resampling_to_gdalwarp(resampling) -> str:
+    """Translate rasterio/rioxarray resampling identifiers to gdalwarp strings."""
+    if str(resampling).endswith(".nearest") or str(resampling) == "0":
+        return "near"
+    if str(resampling).endswith(".bilinear") or str(resampling) == "1":
+        return "bilinear"
+    return "near"
+
+
+def warp_dataarray_to_grid(
+    da: xr.DataArray,
+    master_grid: dict,
+    resampling,
+    temp_dir: Path,
+    temp_prefix: str = "warp",
+    username: str | None = None,
+    password: str | None = None,
+) -> xr.DataArray:
+    """
+    Reproject a DataArray into the master grid using external gdalwarp.
+
+    This avoids Linux heap corruption observed with in-process rio.reproject()
+    on this workflow's GDAL/rasterio stack.
+    """
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_stem = f"{temp_prefix}_{uuid.uuid4().hex}"
+    src_path = temp_dir / f"{temp_stem}_src.tif"
+    warped_path = temp_dir / f"{temp_stem}_warped.tif"
+
+    source_path = None
+    source_encoding = da.encoding.get("source")
+    if source_encoding:
+        source_str = str(source_encoding)
+        source_candidate = Path(source_str)
+        if source_candidate.exists():
+            source_path = source_candidate
+        elif source_str.startswith(("http://", "https://")):
+            with (
+                open_file(
+                    source_str,
+                    earthdata_username=username,
+                    earthdata_password=password,
+                ) as remote_file,
+                open(src_path, "wb") as local_file,
+            ):
+                shutil.copyfileobj(remote_file, local_file)
+            source_path = src_path
+
+    try:
+        if source_path is None:
+            array_to_image(
+                da,
+                output=str(src_path),
+                driver="GTiff",
+                compress="deflate",
+                colormap=None,
+                nodata=da.rio.nodata,
+            )
+            source_path = src_path
+
+        xmin, ymin, xmax, ymax = _grid_bounds_from_master_grid(master_grid)
+        xres = master_grid["transform"].a
+        yres = abs(master_grid["transform"].e)
+
+        gdalwarp_cmd = [
+            _resolve_gdalwarp_binary(),
+            "-overwrite",
+            "-t_srs",
+            str(master_grid["dst_crs"]),
+            "-r",
+            _resampling_to_gdalwarp(resampling),
+            "-tr",
+            str(xres),
+            str(yres),
+            "-te",
+            str(xmin),
+            str(ymin),
+            str(xmax),
+            str(ymax),
+            "-te_srs",
+            str(master_grid["dst_crs"]),
+            "-co",
+            "COMPRESS=DEFLATE",
+        ]
+
+        nodata = da.rio.nodata
+        if nodata is not None and not np.isnan(nodata):
+            nodata_str = str(nodata)
+            gdalwarp_cmd.extend(["-srcnodata", nodata_str, "-dstnodata", nodata_str])
+
+        gdalwarp_cmd.extend([str(source_path), str(warped_path)])
+
+        subprocess.run(
+            gdalwarp_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_build_gdalwarp_env(),
+        )
+
+        warped = rioxarray.open_rasterio(warped_path, masked=False)
+        warped.load()
+        loaded_warped = warped.copy(deep=True)
+        loaded_warped.encoding.pop("source", None)
+        warped.close()
+        return loaded_warped
+
+    except subprocess.CalledProcessError as exc:
+        logger.error("External gdalwarp failed for %s", temp_prefix)
+        if exc.stdout:
+            logger.error("gdalwarp stdout: %s", exc.stdout.strip())
+        if exc.stderr:
+            logger.error("gdalwarp stderr: %s", exc.stderr.strip())
+        raise
+    finally:
+        if src_path.exists() and source_path == src_path:
+            try:
+                src_path.unlink()
+            except Exception:
+                pass
+        if warped_path.exists():
+            try:
+                warped_path.unlink()
+            except Exception:
+                pass
+
+
+def _serialize_raster_metadata(metadata: dict) -> dict:
+    """Convert rasterio metadata into a JSON-safe dictionary."""
+    serialized = metadata.copy()
+
+    for key, value in list(serialized.items()):
+        if isinstance(value, np.generic):
+            serialized[key] = value.item()
+
+    serialized["dtype"] = np.dtype(serialized["dtype"]).name
+
+    crs = serialized.get("crs")
+    if crs is not None:
+        serialized["crs"] = str(crs)
+
+    transform = serialized.get("transform")
+    if isinstance(transform, Affine):
+        serialized["transform"] = list(transform)
+    elif isinstance(transform, tuple):
+        serialized["transform"] = list(transform)
+
+    return serialized
+
+
+def _write_raster_in_subprocess(array: np.ndarray, output: str, metadata: dict) -> None:
+    """Write a raster in a clean subprocess to avoid inherited GDAL heap corruption."""
+    output_path = Path(output)
+    temp_dir = output_path.parent
+    temp_stem = f".array_to_image_{uuid.uuid4().hex}"
+    array_path = temp_dir / f"{temp_stem}.npy"
+    metadata_path = temp_dir / f"{temp_stem}.json"
+
+    np.save(array_path, array, allow_pickle=False)
+    with open(metadata_path, "w") as fh:
+        json.dump(_serialize_raster_metadata(metadata), fh)
+
+    script = """
+import json
+import sys
+import numpy as np
+import rasterio
+from rasterio.transform import Affine
+
+array = np.load(sys.argv[1], allow_pickle=False)
+with open(sys.argv[2]) as fh:
+    metadata = json.load(fh)
+
+transform = metadata.get("transform")
+if transform is not None:
+    metadata["transform"] = Affine(*transform)
+
+colormap = None
+if "colormap" in metadata:
+    colormap = {int(k): tuple(v) for k, v in metadata.pop("colormap").items()}
+with rasterio.open(sys.argv[3], "w", **metadata) as dst:
+    if array.ndim == 2:
+        dst.write(array, 1)
+        if colormap:
+            dst.write_colormap(1, colormap)
+    else:
+        dst.write(np.moveaxis(array, -1, 0))
+        if colormap:
+            for i in range(array.shape[-1]):
+                dst.write_colormap(i + 1, colormap)
+"""
+
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(array_path),
+                str(metadata_path),
+                str(output_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_build_gdalwarp_env(),
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            logger.error("array_to_image subprocess stdout: %s", exc.stdout.strip())
+        if exc.stderr:
+            logger.error("array_to_image subprocess stderr: %s", exc.stderr.strip())
+        raise
+    finally:
+        for path in (array_path, metadata_path):
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+
+
+def compile_and_load_data(
+    data_layer_links,
+    conf_layer_links=None,
+    date_layer_links=None,
+    benchmark_stats=None,
+    username=None,
+    password=None,
+):
+    """
+    Compile and load data from the provided layer links for mosaicking using multithreading.
+
+    Auxiliary link lists must be aligned element-by-element with `data_layer_links`
+    (i.e., built from the same metadata rows). Use None for a granule whose auxiliary
+    file is missing; the corresponding loaded entry will also be None.
+
+    Args:
+        data_layer_links (list): List of URLs corresponding to the OPERA data layers to mosaic.
+        conf_layer_links (list, optional): Confidence layer URLs aligned with data_layer_links.
+        date_layer_links (list, optional): Date layer URLs aligned with data_layer_links.
+        benchmark_stats (dict, optional): Mutable dictionary to track benchmarking stats.
+                                          If provided, enables benchmark mode.
+        username (str, optional): Earthdata username.
+        password (str, optional): Earthdata password.
+
+    Returns:
+        tuple: (DS, conf_DS, date_DS). DS is the list of loaded rioxarray datasets (in granule
+               order). conf_DS and date_DS are lists aligned with DS (None entries where the
+               auxiliary file is missing), or None if not requested or missing for every granule.
+
+    Raises:
+        ValueError: If an auxiliary link list is not the same length as data_layer_links.
+    """
+    for label, aux_links in (("conf", conf_layer_links), ("date", date_layer_links)):
+        if aux_links is not None and len(aux_links) != len(data_layer_links):
+            raise ValueError(
+                f"{label}_layer_links ({len(aux_links)}) must be aligned with "
+                f"data_layer_links ({len(data_layer_links)})."
+            )
+
+    # If the first link exists as a local path, assume all are local and skip auth.
+    if data_layer_links and Path(data_layer_links[0]).exists():
+        logger.info("Local files detected. Skipping Earthdata authentication.")
+    else:
+        # If credentials weren't passed, authenticate (fallback)
+        if not username or not password:
+            username, password = authenticate()
+
+    # Ensure only S1A or S1C are used (not both) for a single date
+    satellite_counts = Counter()
+    for link in data_layer_links:
+        if "S1A" in link:
+            satellite_counts["S1A"] += 1
+        elif "S1C" in link:
+            satellite_counts["S1C"] += 1
+
+    if satellite_counts:
+        # Get the satellite type with the highest count
+        most_common_satellite, _ = satellite_counts.most_common(1)[0]
+        logger.info(
+            f"Most common satellite type: {most_common_satellite}, keeping only those links."
+        )
+
+        # Create a boolean mask to filter all lists consistently
+        is_most_common = [most_common_satellite in link for link in data_layer_links]
+
+        data_layer_links = [
+            link for i, link in enumerate(data_layer_links) if is_most_common[i]
+        ]
+
+        # Filter auxiliary links consistently if they exist
+        if conf_layer_links is not None:
+            conf_layer_links = [
+                link for i, link in enumerate(conf_layer_links) if is_most_common[i]
+            ]
+        if date_layer_links is not None:
+            date_layer_links = [
+                link for i, link in enumerate(date_layer_links) if is_most_common[i]
+            ]
+
+    # Define helpers for loading data
+    def _load_single(link):
+        """Helper to load a single dataset, handling auth fallback. Missing links load as None."""
+        if link is None:
+            return None
+        source_path = None
+        try:
+            source_candidate = Path(str(link))
+            if source_candidate.exists():
+                source_path = source_candidate
+            else:
+                cache_dir = Path("/tmp/disasters_source_cache")
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                suffix = source_candidate.suffix or ".tif"
+                source_path = cache_dir / f"{uuid.uuid4().hex}{suffix}"
+                with (
+                    open_file(
+                        link,
+                        earthdata_username=username,
+                        earthdata_password=password,
+                    ) as remote_file,
+                    open(source_path, "wb") as local_file,
+                ):
+                    shutil.copyfileobj(remote_file, local_file)
+
+            ds = rioxarray.open_rasterio(source_path, masked=False)
+            ds.load()
+            loaded = ds.copy(deep=True)
+            loaded.encoding["source"] = str(source_path)
+            ds.close()
+            return loaded
+        except Exception:
+            if (
+                source_path is not None
+                and source_path.exists()
+                and not Path(str(link)).exists()
+            ):
+                try:
+                    source_path.unlink()
+                except Exception:
+                    pass
+            raise
+
+    def _run_sequential(links):
+        """Sequential loading for benchmarking."""
+        return [_load_single(link) for link in links]
+
+    def _run_concurrent(links):
+        """Concurrent loading using ThreadPoolExecutor."""
+        if not links:
+            return []
+        max_workers = 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            return list(executor.map(_load_single, links))
+
+    def _close_datasets(datasets):
+        """Close any xarray datasets/dataarrays opened for benchmarking."""
+        for ds in datasets:
+            if ds is None:
+                continue
+            try:
+                ds.close()
+            except Exception:
+                pass
+
+    def load_datasets(links, label="Dataset"):
+        """Orchestrates loading. If benchmark_stats is set, runs both and tracks cumulative stats."""
+        if not links:
+            return []
+
+        if benchmark_stats is not None:
+            print(
+                f"\n[BENCHMARK] Testing load speeds for {len(links)} items ({label})..."
+            )
+
+            # Run Sequential
+            sequential_results = []
+            t0 = time.time()
+            try:
+                sequential_results = _run_sequential(links)
+                t_seq = time.time() - t0
+            finally:
+                _close_datasets(sequential_results)
+
+            # Run Concurrent
+            t0 = time.time()
+            results = _run_concurrent(links)
+            t_conc = time.time() - t0
+
+            # Update Globals - Using the 'loading' key
+            if "loading" in benchmark_stats:
+                benchmark_stats["loading"]["seq"] += t_seq
+                benchmark_stats["loading"]["conc"] += t_conc
+
+                # Calculate metrics for printout
+                cum_seq = benchmark_stats["loading"]["seq"]
+                cum_conc = benchmark_stats["loading"]["conc"]
+                cum_saved = cum_seq - cum_conc
+                cum_speedup = cum_seq / cum_conc if cum_conc > 0 else 0
+            else:
+                # Fallback if structure is simple
+                cum_saved = 0
+                cum_speedup = 0
+
+            # Calculate local metrics
+            speedup = t_seq / t_conc if t_conc > 0 else 0
+            saved = t_seq - t_conc
+
+            print(f"   - Sequential: {t_seq:.2f}s")
+            print(f"   - Concurrent: {t_conc:.2f}s")
+            print(f"   >>> SPEEDUP: {speedup:.2f}x (Saved {saved:.2f}s)")
+            if "loading" in benchmark_stats:
+                print(
+                    f"   [CUMULATIVE] Total Saved: {cum_saved:.2f}s | Global Speedup: {cum_speedup:.2f}x"
+                )
+            print("-" * 50)
+
+            return results
+        else:
+            # Standard fast path (concurrent only)
+            logger.info(f"Loading {len(links)} '{label}' granules concurrently...")
+            return _run_concurrent(links)
+
+    def load_aux(links, label):
+        """Load an aligned auxiliary list, or return None if no granule has the layer."""
+        if links is None or all(link is None for link in links):
+            return None
+        missing = sum(link is None for link in links)
+        if missing:
+            logger.warning(
+                f"{missing}/{len(links)} granule(s) are missing the {label} layer."
+            )
+        return load_datasets(links, label=label)
+
+    # Load the primary data layer (DS) and aligned auxiliary layers
+    DS = load_datasets(data_layer_links, label="Primary Data")
+    conf_DS = load_aux(conf_layer_links, "Confidence")
+    date_DS = load_aux(date_layer_links, "Date")
+
+    return DS, conf_DS, date_DS
+
+
+def merge_first_valid(
+    old_data,
+    new_data,
+    merged_mask=None,
+    new_mask=None,
+    index=None,
+    roff=None,
+    coff=None,
+):
+    """
+    Element-wise merge method for continuous integer imagery.
+    Uses Rasterio's mask inputs to perform a copy-first-valid operation.
+
+    Validity is decided by the first band only and applied to all bands, so stacked
+    auxiliary bands (e.g., CONF under WTR) always come from the same granule as band 1.
+    """
+    # Target pixels to update are where band 1 is currently nodata in the merged
+    # output and the new granule has valid band-1 data
+    update_mask = merged_mask[0] & ~new_mask[0]
+
+    old_data[:, update_mask] = new_data[:, update_mask]
+
+    # Update the merged mask so subsequent granules know these pixels are now valid
+    merged_mask[:, update_mask] = False
+
+    return old_data
+
+
+def mosaic_opera(
+    DS: list,
+    product: str = "OPERA_L3_DSWX-S1_V1",
+    layer: str = None,
+    merge_args: dict = {},
+) -> Tuple[xr.DataArray, Optional[dict], float]:
+    """
+    Mosaics a list of OPERA product granules into a single image (in memory).
+
+    Args:
+        DS (list): A list of OPERA product granules opened as xarray.DataArray objects.
+        product (str): OPERA product short name. Used to define pixel prioritization scheme in regions of OPERA granule overlap.
+            Options include: "OPERA_L3_DSWX-HLS_V1","OPERA_L3_DSWX-S1_V1", "OPERA_L3_DIST-ALERT-HLS_V1", "OPERA_L3_DIST-ANN-HLS_V1", "OPERA_L2_RTC-S1_V1"
+            Default: "OPERA_L3_DSWX-S1_V1"
+        layer (str, optional): The specific layer name to mosaic. If None, defaults to the first layer in the DataArray.
+        merge_args (dict, optional): A dictionary of arguments to pass to the rioxarray.merge_arrays function. Defaults to {}.
+
+    Returns:
+        da_mosaic: An xarray.DataArray containing the mosaic of the individual OPERA product granule DataArrays.
+        colormap: A colormap for the mosaic, if in the original OPERA metadata, otherwise None.
+        nodata: The nodata value for the mosaic corresponding to the original OPERA product granule metadata.
+    """
+    DA = []
+    for ds in DS:
+        nodata = ds.rio.nodata
+        da = ds.fillna(nodata)
+        DA.append(da)
+
+    # Define 'valid' values for each product type
+    if product.startswith("OPERA_L3_DSWX"):
+        priority = {
+            1: 100,
+            2: 95,
+            3: 90,
+            0: 50,
+            250: 20,
+            251: 15,
+            252: 10,
+            253: 5,
+            254: 1,
+            255: 0,
+        }
+    elif product.startswith("OPERA_L3_DIST"):
+        priority = {
+            1: 100,
+            2: 100,
+            3: 100,
+            4: 100,
+            5: 100,
+            6: 100,
+            7: 100,
+            8: 100,
+            9: 100,
+            10: 100,
+            0: 10,
+            255: 0,
+        }
+    elif product.startswith("OPERA_L2_RTC"):
+        priority = {}
+    else:
+        priority = {}
+
+    valid_values = set(priority.keys())
+
+    # Check if any DataArray contains non-valid values, if so fall back to default rasterio.merge method
+    if layer == "VEG-ANOM-MAX":
+        method = "first"
+    elif contains_unexpected_values(DA, valid_values):
+        # Continuous imagery/unexpected values (HLS)
+        method = merge_first_valid
+    elif product.startswith("OPERA_L3_DIST") or product.startswith("OPERA_L2_RTC"):
+        method = "first"
+    else:
+        method = opera_rules(product=product, nodata=nodata)
+
+    merged_arr = merge_arrays(DA, method=method)
+
+    try:
+        colormap = get_image_colormap(DS[0])
+    except Exception:
+        colormap = None
+    return merged_arr, colormap, nodata
+
+
+def opera_rules(product: str = "OPERA_L3_DSWX-S1_V1", nodata: int = 255):
+    """
+    Returns a custom callabale rasterio.merge method for OPERA products using pixel priority rules.
+
+    Args:
+        product (str): OPERA product short name, used to determine pixel prioritization in regions of OPERA granule overlap.
+            Options include: "OPERA_L3_DSWX-HLS_V1","OPERA_L3_DSWX-S1_V1", "OPERA_L3_DIST-ALERT-HLS_V1", "OPERA_L3_DIST-ANN-HLS_V1", "OPERA_L2_RTC-S1_V1"
+            Default: "OPERA_L3_DSWX-S1_V1"
+        nodata (int): The nodata value for the OPERA product. Default is 255.
+
+    Returns:
+        method (function): A function that implements the custom merge method for the specified OPERA product.
+    """
+
+    if product in (
+        "OPERA_L3_DSWX-HLS_V1",
+        "OPERA_L3_DSWX-S1_V1",
+        "OPERA_L3_DSWX-NI_V1",
+    ):
+        priority = {
+            1: 100,  # Open water (DSWx-HLS, DSWx-S1)
+            2: 95,  # Partial surface water (DSWx-HLS)
+            3: 95,  # Inundated vegetation (DSWx-S1)
+            0: 50,  # Not water (DSWx-HLS, DSWx-S1)
+            250: 20,  # Height Above Nearest Drainage (HAND) masked (DSWx-S1)
+            251: 15,  # Layover/shadow masked (DSWx-S1)
+            252: 10,  # Snow/Ice (DSWx-HLS)
+            253: 5,  # Cloud/Cloud shadow (DSWx-HLS)
+            254: 1,  # Ocean masked (DSWx-HLS)
+            255: 0,  # Fill value (no data) (DSWx-HLS, DSWx-S1)
+        }
+    elif product in ("OPERA_L3_DIST-ALERT-HLS_V1", "OPERA_L3_DIST-ANN-HLS_V1"):
+        priority = {
+            1: 100,  # first <50%
+            2: 100,  # provisional <50%
+            3: 100,  # confirmed <50%
+            4: 100,  # first ≥50%
+            5: 100,  # provisional ≥50%
+            6: 100,  # confirmed ≥50%
+            7: 100,  # confirmed <50%, finished
+            8: 100,  # confirmed ≥50%, finished
+            9: 100,  # confirmed previous year <50%
+            10: 100,  # confirmed previous year ≥50%
+            0: 10,  # No disturbance
+            255: 0,  # No data
+        }
+    elif product == "OPERA_L2_RTC-S1_V1":
+        priority = {
+            1: 100,  # Open water (DSWx-HLS, DSWx-S1)
+            2: 95,  # Partial surface water (DSWx-HLS)
+            3: 90,  # Inundated vegetation (DSWx-S1)
+            0: 50,  # Not water (DSWx-HLS, DSWx-S1)
+            250: 20,  # Height Above Nearest Drainage (HAND) masked (DSWx-S1)
+            251: 15,  # Layover/shadow masked (DSWx-S1)
+            252: 10,  # Snow/Ice (DSWx-HLS)
+            253: 5,  # Cloud/Cloud shadow (DSWx-HLS)
+            254: 1,  # Ocean masked (DSWx-HLS)
+            255: 0,  # Fill value (no data) (DSWx-HLS, DSWx-S1)
+        }
+
+    else:
+        raise ValueError(
+            f"Unknown product type: {product}. Supported products are DSWx, DIST, RTC."
+        )
+
+    def method(
+        old_data,
+        new_data,
+        old_nodata=None,
+        new_nodata=None,
+        index=None,
+        roff=None,
+        coff=None,
+    ):
+        """
+        Custom merge method for OPERA products using pixel priority rules.
+
+        Args:
+            old_data (numpy.ndarray): The existing data array.
+            new_data (numpy.ndarray): The new data array to merge.
+            old_nodata (int, optional): The nodata value for the existing data. Defaults to None. Required by rasterio.merge.
+            new_nodata (int, optional): The nodata value for the new data. Defaults to None. Required by rasterio.merge.
+            index (tuple, optional): The index of the pixel being merged. Defaults to None. Required by rasterio.merge.
+            roff (int, optional): Row offset. Defaults to None. Required by rasterio.merge.
+            coff (int, optional): Column offset. Defaults to None. Required by rasterio.merge.
+
+        Returns:
+            numpy.ndarray: The merged data array.
+        """
+        max_val = max(priority.keys()) + 1
+        priority_array = np.full(max_val, -1, dtype=np.int16)
+        for val, pri in priority.items():
+            priority_array[val] = pri
+
+        valid_mask = new_data[0] != nodata
+
+        new_vals_safe = np.clip(new_data[0], 0, max_val - 1)
+        old_vals_safe = np.clip(old_data[0], 0, max_val - 1)
+
+        new_priorities = priority_array[new_vals_safe]
+        old_priorities = priority_array[old_vals_safe]
+
+        update_mask = (valid_mask) & (new_priorities > old_priorities)
+
+        # Apply the update
+        for i in range(old_data.shape[0]):
+            old_data[i][update_mask] = new_data[i][update_mask]
+
+        return old_data
+
+    return method
+
+
+def contains_unexpected_values(DA: list, valid_values: set) -> bool:
+    """
+    Check if any DataArray contains non-valid values, checking only the primary band.
+
+    Args:
+        DA (list): List of DataArrays.
+        valid_values (set): Set of expected valid pixel values.
+
+    Returns:
+        bool: True if unexpected values are found, False otherwise.
+    """
+    for da in DA:
+        # Extract the first band for validation
+        if len(da.shape) >= 3:
+            vals_to_check = da.values[0]
+        else:
+            vals_to_check = da.values
+
+        unique_vals = np.unique(vals_to_check)
+
+        # Filter out NaNs if any exist, as they aren't in the priority dictionary
+        unique_vals = unique_vals[~np.isnan(unique_vals)]
+
+        if not set(unique_vals).issubset(valid_values):
+            return True
+
+    return False
+
+
+def get_image_colormap(image, index: int = 1) -> Optional[dict]:
+    """
+    Retrieve the colormap from an image.
+
+    Args:
+        image (str, rasterio.io.DatasetReader, rioxarray.DataArray):
+            The input image. It can be:
+            - A file path to a raster image (string).
+            - A rasterio dataset.
+            - A rioxarray DataArray.
+        index (int): The band index to retrieve the colormap from (default is 1).
+
+    Returns:
+        dict: A dictionary representing the colormap (value: (R, G, B, A)), or None if no colormap is found.
+
+    Raises:
+        ValueError: If the input image type is unsupported.
+    """
+    dataset = None
+
+    if isinstance(image, str):  # File path
+        with rasterio.open(image) as ds:
+            return ds.colormap(index) if ds.count > 0 else None
+    elif isinstance(image, rasterio.io.DatasetReader):  # rasterio dataset
+        dataset = image
+    elif isinstance(image, xr.DataArray) or isinstance(image, xr.Dataset):
+        source = image.encoding.get("source")
+        if source:
+            with rasterio.open(source) as ds:
+                return ds.colormap(index) if ds.count > 0 else None
+        else:
+            raise ValueError(
+                "Cannot extract colormap: DataArray does not have a source."
+            )
+    else:
+        raise ValueError(
+            "Unsupported input type. Provide a file path, rasterio dataset, or rioxarray DataArray."
+        )
+
+    if dataset:
+        return dataset.colormap(index) if dataset.count > 0 else None
+
+
+def array_to_memory_file(
+    array,
+    source: str = None,
+    dtype: str = None,
+    compress: str = "deflate",
+    transpose: bool = True,
+    cellsize: float = None,
+    crs: str = None,
+    transform: tuple = None,
+    driver="COG",
+    colormap: dict = None,
+    **kwargs,
+):
+    """
+    Convert a NumPy array to a memory file.
+
+    Args:
+        array (numpy.ndarray): The input NumPy array.
+        source (str, optional): Path to the source file to extract metadata from. Defaults to None.
+        dtype (str, optional): The desired data type of the array. Defaults to None.
+        compress (str, optional): The compression method for the output file. Defaults to "deflate".
+        transpose (bool, optional): Whether to transpose the array from (bands, rows, columns) to (rows, columns, bands). Defaults to True.
+        cellsize (float, optional): The cell size of the array if source is not provided. Defaults to None.
+        crs (str, optional): The coordinate reference system of the array if source is not provided. Defaults to None.
+        transform (tuple, optional): The affine transformation matrix if source is not provided.
+            Can be rio.transform() or a tuple like (0.5, 0.0, -180.25, 0.0, -0.5, 83.780361). Defaults to None.
+        driver (str, optional): The driver to use for creating the output file, such as 'GTiff'. Defaults to "COG".
+        colormap (dict, optional): A dictionary defining the colormap (value: (R, G, B, A)).
+        **kwargs: Additional keyword arguments to be passed to the rasterio.open() function.
+
+    Returns:
+        rasterio.DatasetReader: The rasterio dataset reader object for the converted array.
+    """
+    if isinstance(array, xr.DataArray):
+        coords = [coord for coord in array.coords]
+        if coords[0] == "time":
+            x_dim = coords[1]
+            y_dim = coords[2]
+            array = (
+                array.isel(time=0).rename({y_dim: "y", x_dim: "x"}).transpose("y", "x")
+            )
+        if hasattr(array, "rio"):
+            if hasattr(array.rio, "crs"):
+                if array.rio.crs is not None:
+                    crs = array.rio.crs
+            if transform is None and hasattr(array.rio, "transform"):
+                transform = array.rio.transform()
+        elif source is None:
+            if hasattr(array, "encoding"):
+                if "source" in array.encoding:
+                    source = array.encoding["source"]
+        array = array.values
+
+    if array.ndim == 3 and transpose:
+        array = np.transpose(array, (1, 2, 0))
+    if source is not None:
+        with rasterio.open(source) as src:
+            crs = src.crs
+            transform = src.transform
+            if compress is None:
+                compress = src.compression
+    else:
+        if crs is None:
+            raise ValueError(
+                "crs must be provided if source is not provided, such as EPSG:3857"
+            )
+
+        if transform is None:
+            if cellsize is None:
+                raise ValueError("cellsize must be provided if source is not provided")
+            # Define the geotransformation parameters
+            xmin, ymin, xmax, ymax = (
+                0,
+                0,
+                cellsize * array.shape[1],
+                cellsize * array.shape[0],
+            )
+            # (west, south, east, north, width, height)
+            transform = rasterio.transform.from_bounds(
+                xmin, ymin, xmax, ymax, array.shape[1], array.shape[0]
+            )
+        elif isinstance(transform, Affine):
+            pass
+        elif isinstance(transform, (tuple, list)):
+            transform = Affine(*transform)
+
+        kwargs["transform"] = transform
+
+    if dtype is None:
+        # Determine the minimum and maximum values in the array
+        min_value = np.min(array)
+        max_value = np.max(array)
+        # Determine the best dtype for the array
+        if min_value >= 0 and max_value <= 1:
+            dtype = np.float32
+        elif min_value >= 0 and max_value <= 255:
+            dtype = np.uint8
+        elif min_value >= -128 and max_value <= 127:
+            dtype = np.int8
+        elif min_value >= 0 and max_value <= 65535:
+            dtype = np.uint16
+        elif min_value >= -32768 and max_value <= 32767:
+            dtype = np.int16
+        else:
+            dtype = np.float64
+
+    # Convert the array to the best dtype
+    array = array.astype(dtype)
+    # Define the GeoTIFF metadata
+    metadata = {
+        "driver": driver,
+        "height": array.shape[0],
+        "width": array.shape[1],
+        "dtype": array.dtype,
+        "crs": crs,
+        "transform": transform,
+    }
+
+    if array.ndim == 2:
+        metadata["count"] = 1
+    elif array.ndim == 3:
+        metadata["count"] = array.shape[2]
+    if compress is not None:
+        metadata["compress"] = compress
+
+    metadata.update(**kwargs)
+
+    # Create a new memory file and write the array to it
+    memory_file = rasterio.MemoryFile()
+    dst = memory_file.open(**metadata)
+
+    if array.ndim == 2:
+        dst.write(array, 1)
+        if colormap:
+            dst.write_colormap(1, colormap)
+    elif array.ndim == 3:
+        for i in range(array.shape[2]):
+            dst.write(array[:, :, i], i + 1)
+            if colormap:
+                dst.write_colormap(i + 1, colormap)
+
+    dst.close()
+    # Read the dataset from memory
+    dataset_reader = rasterio.open(dst.name, mode="r")
+
+    return dataset_reader
+
+
+def array_to_image(
+    array,
+    output: str = None,
+    source: str = None,
+    dtype: str = None,
+    compress: str = "deflate",
+    transpose: bool = True,
+    cellsize: float = None,
+    crs: str = None,
+    transform: tuple = None,
+    driver: str = "COG",
+    colormap: dict = None,
+    **kwargs,
+) -> str:
+    """Save a NumPy array as a GeoTIFF using the projection information from an existing GeoTIFF file.
+
+    Args:
+        array (np.ndarray): The NumPy array to be saved as a GeoTIFF.
+        output (str): The path to the output image. If None, a temporary file will be created. Defaults to None.
+        source (str, optional): The path to an existing GeoTIFF file with map projection information. Defaults to None.
+        dtype (np.dtype, optional): The data type of the output array. Defaults to None.
+        compress (str, optional): The compression method. Can be one of the following: "deflate", "lzw", "packbits", "jpeg". Defaults to "deflate".
+        transpose (bool, optional): Whether to transpose the array from (bands, rows, columns) to (rows, columns, bands). Defaults to True.
+        cellsize (float, optional): The resolution of the output image in meters. Defaults to None.
+        crs (str, optional): The CRS of the output image. Defaults to None.
+        transform (tuple, optional): The affine transformation matrix, can be rio.transform() or a tuple like (0.5, 0.0, -180.25, 0.0, -0.5, 83.780361).
+            Defaults to None.
+        driver (str, optional): The driver to use for creating the output file, such as 'GTiff'. Defaults to "COG".
+        colormap (dict, optional): A dictionary defining the colormap (value: (R, G, B, A)).
+        **kwargs: Additional keyword arguments to be passed to the rasterio.open() function.
+    """
+    if output is None:
+        return array_to_memory_file(
+            array,
+            source,
+            dtype,
+            compress,
+            transpose,
+            cellsize,
+            crs=crs,
+            transform=transform,
+            driver=driver,
+            colormap=colormap,
+            **kwargs,
+        )
+
+    if isinstance(array, xr.DataArray):
+        if "latitude" in array.dims and "longitude" in array.dims:
+            array = array.rename({"latitude": "y", "longitude": "x"})
+        elif "lat" in array.dims and "lon" in array.dims:
+            array = array.rename({"lat": "y", "lon": "x"})
+
+        if (
+            hasattr(array, "rio")
+            and (array.rio.crs is not None)
+            and (array.rio.transform() is not None)
+        ):
+            crs = array.rio.crs
+            transform = array.rio.transform()
+        elif (
+            source is None
+            and hasattr(array, "encoding")
+            and ("source" in array.encoding)
+        ):
+            source = array.encoding["source"]
+
+        if array.ndim == 2 and ("x" in array.dims) and ("y" in array.dims):
+            array = array.transpose("y", "x")
+        elif array.ndim == 3 and ("x" in array.dims) and ("y" in array.dims):
+            dims = list(array.dims)
+            dims.remove("x")
+            dims.remove("y")
+            array = array.transpose(dims[0], "y", "x")
+
+        if "long_name" in array.attrs:
+            array.attrs.pop("long_name")
+
+        # Avoid rioxarray's to_raster writer here; writing through rasterio has
+        # been more stable for large mosaics in this pipeline.
+        array = array.values
+
+    if array.ndim == 3 and transpose:
+        array = np.transpose(array, (1, 2, 0))
+
+    if array.ndim == 3 and array.shape[2] == 1:
+        array = array[:, :, 0]
+
+    out_dir = os.path.dirname(os.path.abspath(output))
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    ext = os.path.splitext(output)[-1].lower()
+    if ext == "":
+        output += ".tif"
+        ext = ".tif"
+
+    if driver is None:
+        if ext in (".tif", ".tiff"):
+            driver = "GTiff"
+        elif ext == ".png":
+            driver = "PNG"
+        elif ext == ".jpg" or ext == ".jpeg":
+            driver = "JPEG"
+        elif ext == ".jp2":
+            driver = "JP2OpenJPEG"
+        else:
+            driver = "COG"
+    elif ext in (".tif", ".tiff") and driver == "COG":
+        # Temporary .tif outputs in this pipeline are written as plain GeoTIFFs
+        # and converted to COG in a later step.
+        driver = "GTiff"
+
+    if source is not None:
+        with rasterio.open(source) as src:
+            crs = src.crs
+            transform = src.transform
+            if compress is None:
+                compress = src.compression
+    else:
+        if crs is None:
+            raise ValueError(
+                "crs must be provided if source is not provided, such as EPSG:3857"
+            )
+
+        if transform is None:
+            # Define the geotransformation parameters
+            xmin, ymin, xmax, ymax = (
+                0,
+                0,
+                cellsize * array.shape[1],
+                cellsize * array.shape[0],
+            )
+            transform = rasterio.transform.from_bounds(
+                xmin, ymin, xmax, ymax, array.shape[1], array.shape[0]
+            )
+        elif isinstance(transform, Affine):
+            pass
+        elif isinstance(transform, (tuple, list)):
+            transform = Affine(*transform)
+
+        kwargs["transform"] = transform
+
+    if dtype is None:
+        # Determine the minimum and maximum values in the array
+        min_value = np.min(array)
+        max_value = np.max(array)
+        # Determine the best dtype for the array
+        if min_value >= 0 and max_value <= 1:
+            dtype = np.float32
+        elif min_value >= 0 and max_value <= 255:
+            dtype = np.uint8
+        elif min_value >= -128 and max_value <= 127:
+            dtype = np.int8
+        elif min_value >= 0 and max_value <= 65535:
+            dtype = np.uint16
+        elif min_value >= -32768 and max_value <= 32767:
+            dtype = np.int16
+        else:
+            dtype = np.float64
+
+    # Convert the array to the best dtype
+    array = array.astype(dtype)
+
+    # Define the GeoTIFF metadata
+    metadata = {
+        "driver": driver,
+        "height": array.shape[0],
+        "width": array.shape[1],
+        "dtype": array.dtype,
+        "crs": crs,
+        "transform": transform,
+    }
+
+    if array.ndim == 2:
+        metadata["count"] = 1
+    elif array.ndim == 3:
+        metadata["count"] = array.shape[2]
+    if compress is not None and (driver in ["GTiff", "COG"]):
+        metadata["compress"] = compress
+
+    # Pass colormap to metadata dictionary (if applicable)
+    if colormap:
+        metadata["colormap"] = colormap
+
+    metadata.update(**kwargs)
+    logger.info(
+        "array_to_image opening raster: output=%s driver=%s shape=%s dtype=%s count=%s crs=%s transform=%s photometric=%s",
+        output,
+        metadata["driver"],
+        array.shape,
+        array.dtype,
+        metadata.get("count"),
+        metadata["crs"],
+        metadata["transform"],
+        metadata.get("photometric"),
+    )
+
+    output_path = Path(output)
+    if output_path.exists():
+        logger.info(
+            "array_to_image removing existing output before rewrite: %s", output
+        )
+        output_path.unlink()
+
+    # Execute through the safe memory-isolated subprocess if it's a TIF!
+    if driver in ["GTiff", "COG"]:
+        _write_raster_in_subprocess(array, output, metadata)
+        return output
+
+    # Fallback to direct rasterio writing for non-TIF formats (e.g. PNG/JPEG)
+    with rasterio.open(output, "w", **metadata) as dst:
+        if array.ndim == 2:
+            logger.info(
+                "array_to_image writing 2D array: output=%s shape=%s dtype=%s strides=%s c_contig=%s f_contig=%s",
+                output,
+                array.shape,
+                array.dtype,
+                array.strides,
+                array.flags["C_CONTIGUOUS"],
+                array.flags["F_CONTIGUOUS"],
+            )
+            if colormap:
+                dst.write_colormap(1, colormap)
+            dst.write(array, 1)
+        elif array.ndim == 3:
+            for i in range(array.shape[2]):
+                band = array[:, :, i]
+                logger.info(
+                    "array_to_image writing band: output=%s band=%s array_shape=%s band_shape=%s dtype=%s "
+                    "array_strides=%s band_strides=%s array_c_contig=%s band_c_contig=%s band_f_contig=%s",
+                    output,
+                    i + 1,
+                    array.shape,
+                    band.shape,
+                    band.dtype,
+                    array.strides,
+                    band.strides,
+                    array.flags["C_CONTIGUOUS"],
+                    band.flags["C_CONTIGUOUS"],
+                    band.flags["F_CONTIGUOUS"],
+                )
+                if colormap:
+                    dst.write_colormap(i + 1, colormap)
+                dst.write(band, i + 1)
+    return output
