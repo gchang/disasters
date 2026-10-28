@@ -44,6 +44,20 @@ The provided `environment.yml` file sets up a fully functional environment, and 
 
 `environment.yml` is the source of truth for the working environment (including conda-native/system packages like GDAL and notebook/tooling dependencies). `pyproject.toml` pulls package runtime dependencies dynamically from `requirements.txt` for packaging/install metadata.
 
+#### Linux x86_64: install from the lock file
+
+Solving `environment.yml` takes several minutes. On Linux x86_64, `conda-linux-64.lock` is the same environment solved to exact packages (conda-forge URLs with MD5 sums), so it installs without a solver step. `next_pass` comes from GitHub, not conda-forge, so install it at the commit the lock was made with before installing this package:
+
+```bash
+cd disasters
+conda create -n disasters --file conda-linux-64.lock
+conda activate disasters
+pip install "next_pass @ git+https://github.com/OPERA-Cal-Val/next_pass.git@99a55e644caa21b64931c49c48c4def8adf4c3ff"
+pip install .
+```
+
+`next_pass` brings a few packages from PyPI that are not in the lock (rich, timezonefinder, yagmail and their dependencies). After changing `environment.yml`, refresh the lock by creating an environment from `environment.yml` and running `conda list --explicit --md5 > conda-linux-64.lock` in it.
+
 3. (Optional) Install pre-commit hooks for automatic code quality checks:
 
 ```bash
