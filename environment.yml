@@ -22,6 +22,10 @@ dependencies:
   - pandas
   - pip
   - pygmt
+  # GMT build 7 is the newest GMT 6.6.0 built against GDAL 3.12. Newer GMT builds need
+  # GDAL 3.13, which the gdal pin above rules out, and without this line the solver
+  # spends a very long time backtracking before it finds a compatible GMT.
+  - gmt=6.6.0=*_7
   - rasterio
   - rioxarray<0.20.0
   - tabulate
