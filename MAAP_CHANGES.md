@@ -2,7 +2,7 @@
 
 Upstream: https://github.com/OPERA-Cal-Val/disasters, branch `main` at commit 2c49a0ea4735c813cff0233cb4225621decf4248 (2026-10-21; the repository has no tags), by the OPERA Cal/Val team with the NASA Disasters program. Apache License 2.0 (`LICENSE`).
 
-This copy starts from upstream's file tree at 2c49a0e without its git history. Upstream has no `.github/` folder, so nothing was left out. The workflow code under `src/disasters/`, the tests and the LICENSE are untouched; only the environment files and the README changed, as listed below. Results do not change.
+This copy starts from upstream's file tree at 2c49a0e without its git history. Upstream has no `.github/` folder, so nothing was left out. The LICENSE and the existing tests are untouched. The environment files and the README changed, and the workflow code gained one opt-in option for reading PO.DAAC tiles from S3 inside AWS us-west-2, as listed below. Results do not change.
 
 ## 2026-10-28: environment.yml pins GMT to a build made for GDAL 3.12
 
@@ -39,4 +39,25 @@ On 2026-10-28, on Linux x86_64 (an EC2 machine in AWS us-west-2, 4 cores), from 
 
 - The DSWx-S1 WTR mosaic for the 2026-10-21 13:42 descending pass (UTM 11N, 3064 x 2667 pixels at 30 m) was compared with the 6 official DSWx-S1 tiles it was built from, each warped onto the mosaic grid with nearest neighbor: 99.973% of 13,294,932 overlapping pixels are identical. All 3,582 differing pixels lie where two or more tiles overlap, where the mosaic keeps the first valid tile; where only one tile covers a pixel there are no differences. This is the same result as with upstream's environment on 2026-10-24.
 
-One thing to know when running inside AWS us-west-2: PO.DAAC's HTTPS download endpoint answers there with a presigned in-region S3 address that returns 403 AccessDenied, so the DSWx-HLS and DSWx-S1 tiles cannot be streamed over HTTPS (`opera_utils.disp._remote.open_file`, used in `mosaic.py` and `pipeline.py`). For this check those reads went to PO.DAAC by direct S3 with its temporary credentials (`https://archive.podaac.earthdata.nasa.gov/s3credentials`). Outside AWS, the HTTPS route works unchanged. The code here was not changed for this.
+Inside AWS us-west-2 the PO.DAAC tiles could not be read over HTTPS; the next section adds an option for that. In this check those reads went to PO.DAAC by direct S3 through a wrapper outside the code.
+
+## 2026-10-28: an option to read PO.DAAC tiles from S3 inside AWS us-west-2
+
+Why: the DSWx-HLS and DSWx-S1 tiles come from PO.DAAC. From inside AWS us-west-2 (where NASA MAAP runs), PO.DAAC answers an HTTPS download of these tiles with a redirect to an in-region S3 address that refuses the read with 403 Forbidden, while a HEAD request still succeeds. So `run` fails there at the first PO.DAAC tile. The same file can be read directly from PO.DAAC's bucket with PO.DAAC's temporary S3 credentials (`https://archive.podaac.earthdata.nasa.gov/s3credentials`), and the HTTPS link maps one to one onto the bucket: `https://archive.podaac.earthdata.nasa.gov/<bucket>/<key>` is `s3://<bucket>/<key>`.
+
+What changed (one commit each):
+
+- `src/disasters/auth.py`: an opt-in, `DISASTERS_PODAAC_S3=1` or `set_podaac_s3(True)`, off by default. `open_granule()` opens PO.DAAC links from S3 (s3fs) and every other link through opera_utils' `open_file` exactly as before; `podaac_gdal_path()` gives `/vsis3/<bucket>/<key>` for GDAL reads. PO.DAAC credentials are taken from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` when those are set (so a platform can supply them), and otherwise fetched from PO.DAAC with the Earthdata login through `earthaccess.get_s3_credentials(daac="PODAAC")` and fetched again after 45 minutes, before the one-hour credentials expire. GDAL gets them as path-specific options for the PO.DAAC bucket only, so the ASF credentials that `authenticate()` sets for all other S3 reads stay in place, and the two sets never overwrite each other. No instance metadata lookup is added. When `AWS_REGION` or `AWS_DEFAULT_REGION` is `us-west-2` and the option is off, the log prints a hint; the option is not switched on by itself. `s3fs` (already installed as an earthaccess dependency) is now listed in `environment.yml` and `requirements.txt` because auth.py imports it; the solved environment is the same, so `conda-linux-64.lock` is unchanged.
+- Every PO.DAAC read goes through these helpers: the tile loads and the warp source in `mosaic.py`, the `download` command and the GDAL direct-to-disk mosaic and bounds reads in `pipeline.py`, the orbit-direction read in `catalog.py`, the B10 DEM warp in `filters.py` (GDAL `/vsicurl` before), and the DEM fetcher in `catalog.py` (which copies the DEM files itself under the option, because `earthaccess.download` would use the HTTPS links).
+- `src/disasters/cli.py`: `--podaac-s3` on `run`, `download` and `slope-filter`, the same as setting the environment variable.
+- `tests/test_podaac_s3.py`: 8 tests (off by default, also with `AWS_REGION=us-west-2`; the variable and the flag; link mapping; credentials from the environment and from PO.DAAC with renewal; GDAL options scoped to the PO.DAAC bucket; the HTTPS fallback).
+- README: a section "Running inside AWS us-west-2 (for example NASA MAAP)" and the flag in the argument table.
+
+Without the option, nothing changes: the same HTTPS reads as before.
+
+Check, on 2026-10-28, on an EC2 machine in AWS us-west-2 (so with the same PO.DAAC behavior as MAAP), 4 cores and 16 GB, from a fresh `git clone` of this repository, environment from `conda-linux-64.lock` (1 min 26 s) plus the two `pip install` steps; `pip check` clean; Earthdata login in `~/.netrc`, no AWS variables set:
+
+- `pytest tests`: 27 passed, 1 failed (the known test bug described above).
+- `opera-disaster run -b "36 36.5 -114.5 -114" -m flood -d 2026-10-21 -n 2 -o LakeMead -lt "Lake Mead Floods" --functionality opera_search --podaac-s3`: the log shows one PO.DAAC credential request and 60 tile reads from `s3://podaac-ops-cumulus-protected/` (WTR, BWTR and CONF of DSWx-HLS and DSWx-S1), no warnings or errors. The flood products (25 GeoTIFFs, 14 map PNGs, 14 PDF layouts) were done 6 minutes after the start. The OpenStreetMap building-count step then ran its first pass (no buildings in the flooded areas) and was stopped at 54 minutes in window 14 of 16 of its second pass; it only queries the public Overpass API and does not change the flood products. Peak memory 13.2 GB.
+- The DSWx-S1 WTR mosaic of the 2026-10-21 13:42 descending pass (UTM 12N, 1561 x 1900 pixels) against the 4 official tiles it was built from, each warped onto the mosaic grid with nearest neighbor: 99.976% of 5,795,081 overlapping pixels are identical. All 1,379 differing pixels lie where two tiles overlap (the mosaic keeps the first valid tile); there are none where a single tile covers.
+- The same command without `--podaac-s3` still reads over HTTPS and stops at the first PO.DAAC tile with 403 Forbidden from the in-region S3 redirect, as before this change.
